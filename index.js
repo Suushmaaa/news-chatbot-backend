@@ -15,9 +15,7 @@ const port = process.env.PORT || 5000;
 app.use(cors({
      origin: [
        'http://localhost:3000',
-       'https://new-chatbot-frontend.vercel.app',
-       'https://new-chatbot-frontend-git-main-suushmaaas-projects.vercel.app',
-      'https://new-chatbot-frontend-p8tr2ovhv-suushmaaas-projects.vercel.app'
+       'https://newschatbot1.netlify.app',
 
      ],
      credentials: true
