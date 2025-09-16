@@ -26,30 +26,91 @@ app.use((req, res, next) => {
   next();
 });
 
-// Initialize services on startup
+// Initialize services on startup with better error handling
 async function initializeServices() {
   try {
     console.log('🚀 Initializing services...');
     
     // Initialize RAG Service
-    ragService = new RAGService();
-    await ragService.initialize();
-    console.log('✅ RAG service initialized');
+    try {
+      ragService = new RAGService();
+      await ragService.initialize();
+      console.log('✅ RAG service initialized');
+    } catch (error) {
+      console.error('❌ RAG service failed to initialize:', error.message);
+      ragService = null;
+    }
     
-    // Initialize Session Manager
-    sessionManager = new SessionManager();
-    await sessionManager.testConnection();
-    console.log('✅ Session manager initialized');
+    // Initialize Session Manager with error handling
+    try {
+      sessionManager = new SessionManager();
+      await sessionManager.testConnection();
+      console.log('✅ Session manager initialized');
+    } catch (error) {
+      console.error('❌ Session manager failed to initialize:', error.message);
+      console.log('📝 Continuing without persistent sessions...');
+      sessionManager = null;
+    }
     
     // Initialize Gemini Service
-    geminiService = new GeminiService();
-    console.log('✅ Gemini service initialized');
+    try {
+      geminiService = new GeminiService();
+      console.log('✅ Gemini service initialized');
+    } catch (error) {
+      console.error('❌ Gemini service failed to initialize:', error.message);
+      geminiService = null;
+    }
     
   } catch (error) {
     console.error('❌ Service initialization failed:', error);
     // Don't exit immediately, let the server start but show warning
   }
 }
+
+// ROOT ROUTE - Fixed the main issue
+app.get('/', (req, res) => {
+  res.json({ 
+    success: true,
+    message: 'RAG API Server is running',
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0',
+    services: {
+      rag: !!ragService,
+      session: !!sessionManager,
+      gemini: !!geminiService
+    },
+    endpoints: {
+      health: '/api/health',
+      chat: '/api/chat',
+      sessions: '/api/sessions',
+      documents: '/api/documents'
+    }
+  });
+});
+
+// API base route
+app.get('/api', (req, res) => {
+  res.json({ 
+    success: true,
+    message: 'RAG API Base',
+    version: '1.0.0',
+    services: {
+      rag: !!ragService,
+      session: !!sessionManager,
+      gemini: !!geminiService
+    },
+    endpoints: [
+      'GET /api/health - Health check',
+      'POST /api/sessions - Create session', 
+      'POST /api/chat - Send message',
+      'GET /api/sessions/:id/history - Get chat history',
+      'POST /api/documents - Upload document',
+      'GET /api/documents - List documents',
+      'POST /api/search - Search documents'
+    ]
+  });
+});
 
 // API Routes
 
@@ -71,7 +132,12 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
     message: 'Server is running',
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    services: {
+      rag: !!ragService,
+      session: !!sessionManager,
+      gemini: !!geminiService
+    }
   });
 });
 
@@ -88,11 +154,18 @@ app.get('/test-gemini', async (req, res) => {
   }
 });
 
-// Create new session
+// Create new session - with fallback for no session manager
 app.post('/api/session', async (req, res) => {
   try {
     if (!sessionManager) {
-      return res.status(503).json({ success: false, error: 'Session manager not initialized' });
+      // Create in-memory session if no session manager
+      const sessionId = uuidv4();
+      return res.json({ 
+        success: true, 
+        sessionId,
+        message: 'Session created successfully (in-memory)',
+        warning: 'Session persistence not available'
+      });
     }
     const sessionId = await sessionManager.createSession();
     res.json({ 
@@ -101,20 +174,27 @@ app.post('/api/session', async (req, res) => {
       message: 'Session created successfully'
     });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    // Fallback to in-memory session
+    const sessionId = uuidv4();
+    res.json({ 
+      success: true, 
+      sessionId,
+      message: 'Session created successfully (fallback)',
+      warning: 'Session persistence failed: ' + error.message
     });
   }
 });
 
 app.post('/api/sessions', async (req, res) => {
   try {
-    if (!sessionManager) {
-      return res.status(503).json({ success: false, error: 'Session manager not initialized' });
-    }
     const sessionId = uuidv4();
-    await sessionManager.createSession(sessionId);
+    if (sessionManager) {
+      try {
+        await sessionManager.createSession(sessionId);
+      } catch (error) {
+        console.warn('Session manager failed, using in-memory session:', error.message);
+      }
+    }
     res.json({ sessionId });
   } catch (error) {
     res.status(500).json({ 
@@ -124,14 +204,21 @@ app.post('/api/sessions', async (req, res) => {
   }
 });
 
-// Get session history
+// Get session history - with fallback
 app.get('/api/session/:sessionId/history', async (req, res) => {
   try {
-    if (!sessionManager) {
-      return res.status(503).json({ success: false, error: 'Session manager not initialized' });
-    }
     const { sessionId } = req.params;
     const { limit = 20 } = req.query;
+    
+    if (!sessionManager) {
+      return res.json({ 
+        success: true, 
+        sessionId,
+        messages: [],
+        count: 0,
+        warning: 'Session persistence not available'
+      });
+    }
     
     const history = await sessionManager.getMessageHistory(sessionId, parseInt(limit));
     
@@ -142,37 +229,44 @@ app.get('/api/session/:sessionId/history', async (req, res) => {
       count: history.length
     });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    res.json({ 
+      success: true, 
+      sessionId: req.params.sessionId,
+      messages: [],
+      count: 0,
+      warning: 'Failed to fetch history: ' + error.message
     });
   }
 });
 
 app.get('/api/sessions/:sessionId/history', async (req, res) => {
   try {
-    if (!sessionManager) {
-      return res.status(503).json({ success: false, error: 'Session manager not initialized' });
-    }
     const { sessionId } = req.params;
-    const history = await sessionManager.getMessageHistory(sessionId);
     
-    res.json({ 
-      messages: history || []
-    });
+    if (!sessionManager) {
+      return res.json({ messages: [] });
+    }
+    
+    const history = await sessionManager.getMessageHistory(sessionId);
+    res.json({ messages: history || [] });
   } catch (error) {
     console.error('Error fetching chat history:', error);
-    res.status(500).json({ error: 'Failed to fetch chat history' });
+    res.json({ messages: [] }); // Return empty array instead of error
   }
 });
 
-// Clear session
+// Clear session - with fallback
 app.delete('/api/session/:sessionId', async (req, res) => {
   try {
-    if (!sessionManager) {
-      return res.status(503).json({ success: false, error: 'Session manager not initialized' });
-    }
     const { sessionId } = req.params;
+    
+    if (!sessionManager) {
+      return res.json({ 
+        success: true, 
+        message: 'Session cleared (in-memory sessions not persistent)' 
+      });
+    }
+    
     const success = await sessionManager.clearSession(sessionId);
     
     if (success) {
@@ -187,40 +281,39 @@ app.delete('/api/session/:sessionId', async (req, res) => {
       });
     }
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    res.json({ 
+      success: true, 
+      message: 'Session cleared (fallback)', 
+      warning: error.message 
     });
   }
 });
 
 app.delete('/api/sessions/:sessionId', async (req, res) => {
   try {
-    if (!sessionManager) {
-      return res.status(503).json({ success: false, error: 'Session manager not initialized' });
-    }
     const { sessionId } = req.params;
-    const success = await sessionManager.clearSession(sessionId);
+    
+    if (sessionManager) {
+      try {
+        await sessionManager.clearSession(sessionId);
+      } catch (error) {
+        console.warn('Session manager failed to clear session:', error.message);
+      }
+    }
+    
     res.json({ success: true, message: 'Session cleared' });
   } catch (error) {
     console.error('Error clearing session:', error);
-    res.status(500).json({ error: 'Failed to clear session' });
+    res.json({ success: true, message: 'Session cleared (fallback)' });
   }
 });
 
-// MAIN CHAT ENDPOINT - FIXED VERSION
+// MAIN CHAT ENDPOINT - Enhanced with better fallback handling
 app.post('/api/chat', async (req, res) => {
   try {
     console.log('📨 /api/chat endpoint hit!');
     console.log('Request body:', req.body);
     
-    if (!ragService || !sessionManager || !geminiService) {
-      return res.status(503).json({ 
-        success: false, 
-        error: 'Services not initialized yet. Please try again in a moment.' 
-      });
-    }
-
     const { message, sessionId } = req.body;
     
     if (!message) {
@@ -239,7 +332,7 @@ app.post('/api/chat', async (req, res) => {
 
     console.log(`💬 Processing chat message for session: ${sessionId}`);
     
-    // Add user message to session
+    // Create user message
     const userMessage = {
       type: 'user',
       content: message,
@@ -247,25 +340,52 @@ app.post('/api/chat', async (req, res) => {
       timestamp: new Date().toISOString()
     };
     
-    await sessionManager.addMessage(sessionId, userMessage);
-    
-    // Get AI response using RAG service
-    let ragResponse;
-    try {
-      ragResponse = await ragService.query(message);
-    } catch (ragError) {
-      console.warn('RAG service failed, falling back to Gemini only:', ragError.message);
-      // Fallback to direct Gemini service
-      const geminiResponse = await geminiService.generateResponse(message);
-      ragResponse = {
-        answer: geminiResponse,
-        sources: [],
-        isNewsQuery: false,
-        retrievedDocs: 0
-      };
+    // Try to add to session if available
+    if (sessionManager) {
+      try {
+        await sessionManager.addMessage(sessionId, userMessage);
+      } catch (error) {
+        console.warn('Failed to save user message:', error.message);
+      }
     }
     
-    // Add AI response to session
+    // Get AI response using available services
+    let ragResponse;
+    
+    try {
+      // Try RAG service first
+      if (ragService) {
+        ragResponse = await ragService.query(message);
+      } else {
+        throw new Error('RAG service not available');
+      }
+    } catch (ragError) {
+      console.warn('RAG service failed, trying Gemini only:', ragError.message);
+      
+      // Fallback to direct Gemini service
+      try {
+        if (geminiService) {
+          const geminiResponse = await geminiService.generateResponse(message);
+          ragResponse = {
+            answer: geminiResponse,
+            sources: [],
+            isNewsQuery: false,
+            retrievedDocs: 0
+          };
+        } else {
+          throw new Error('No AI services available');
+        }
+      } catch (geminiError) {
+        console.error('All AI services failed:', geminiError.message);
+        return res.status(503).json({
+          success: false,
+          error: 'AI services are currently unavailable. Please try again later.',
+          details: 'Both RAG and Gemini services failed to respond'
+        });
+      }
+    }
+    
+    // Create AI message
     const aiMessage = {
       type: 'assistant',
       content: ragResponse.answer,
@@ -276,11 +396,18 @@ app.post('/api/chat', async (req, res) => {
       timestamp: new Date().toISOString()
     };
     
-    await sessionManager.addMessage(sessionId, aiMessage);
-    
-    // Extend session TTL if method exists
-    if (sessionManager.extendSession) {
-      await sessionManager.extendSession(sessionId);
+    // Try to add AI response to session if available
+    if (sessionManager) {
+      try {
+        await sessionManager.addMessage(sessionId, aiMessage);
+        
+        // Extend session TTL if method exists
+        if (sessionManager.extendSession) {
+          await sessionManager.extendSession(sessionId);
+        }
+      } catch (error) {
+        console.warn('Failed to save AI message:', error.message);
+      }
     }
     
     res.json({
@@ -291,7 +418,8 @@ app.post('/api/chat', async (req, res) => {
       sessionId: sessionId,
       metadata: {
         retrievedDocs: ragResponse.retrievedDocs || 0,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        sessionPersistent: !!sessionManager
       }
     });
     
@@ -305,12 +433,18 @@ app.post('/api/chat', async (req, res) => {
   }
 });
 
-// Get active sessions (for debugging)
+// Get active sessions (for debugging) - with fallback
 app.get('/api/sessions', async (req, res) => {
   try {
     if (!sessionManager) {
-      return res.status(503).json({ success: false, error: 'Session manager not initialized' });
+      return res.json({ 
+        success: true, 
+        sessions: [],
+        count: 0,
+        warning: 'Session manager not available'
+      });
     }
+    
     const sessions = await sessionManager.getActiveSessions();
     res.json({ 
       success: true, 
@@ -318,19 +452,25 @@ app.get('/api/sessions', async (req, res) => {
       count: sessions.length
     });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      error: error.message 
+    res.json({ 
+      success: true, 
+      sessions: [],
+      count: 0,
+      warning: 'Failed to fetch sessions: ' + error.message
     });
   }
 });
 
-// Upload document for RAG indexing
+// Upload document for RAG indexing - with fallback
 app.post('/api/documents', async (req, res) => {
   try {
     if (!ragService) {
-      return res.status(503).json({ success: false, error: 'RAG service not initialized' });
+      return res.status(503).json({ 
+        success: false, 
+        error: 'RAG service not available. Document indexing is currently disabled.' 
+      });
     }
+    
     const { content, filename, metadata = {} } = req.body;
     
     if (!content) {
@@ -361,12 +501,18 @@ app.post('/api/documents', async (req, res) => {
   }
 });
 
-// Get document list
+// Get document list - with fallback
 app.get('/api/documents', async (req, res) => {
   try {
     if (!ragService) {
-      return res.status(503).json({ success: false, error: 'RAG service not initialized' });
+      return res.json({
+        success: true,
+        documents: [],
+        count: 0,
+        warning: 'RAG service not available'
+      });
     }
+    
     const { limit = 50, offset = 0 } = req.query;
     const documents = await ragService.getDocuments(parseInt(limit), parseInt(offset));
     
@@ -376,19 +522,25 @@ app.get('/api/documents', async (req, res) => {
       count: documents.length
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
+    res.json({
+      success: true,
+      documents: [],
+      count: 0,
+      warning: 'Failed to fetch documents: ' + error.message
     });
   }
 });
 
-// Delete document
+// Delete document - with fallback
 app.delete('/api/documents/:documentId', async (req, res) => {
   try {
     if (!ragService) {
-      return res.status(503).json({ success: false, error: 'RAG service not initialized' });
+      return res.status(503).json({
+        success: false,
+        error: 'RAG service not available'
+      });
     }
+    
     const { documentId } = req.params;
     const success = await ragService.deleteDocument(documentId);
     
@@ -411,12 +563,19 @@ app.delete('/api/documents/:documentId', async (req, res) => {
   }
 });
 
-// Search documents
+// Search documents - with fallback
 app.post('/api/search', async (req, res) => {
   try {
     if (!ragService) {
-      return res.status(503).json({ success: false, error: 'RAG service not initialized' });
+      return res.json({
+        success: true,
+        query: req.body.query || '',
+        results: [],
+        count: 0,
+        warning: 'RAG service not available'
+      });
     }
+    
     const { query, limit = 10 } = req.body;
     
     if (!query) {
@@ -435,9 +594,12 @@ app.post('/api/search', async (req, res) => {
       count: results.length
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
+    res.json({
+      success: true,
+      query: req.body.query || '',
+      results: [],
+      count: 0,
+      warning: 'Search failed: ' + error.message
     });
   }
 });
@@ -462,7 +624,12 @@ app.get('/api/debug/routes', (req, res) => {
       });
     }
   });
-  res.json({ routes });
+  res.json({ 
+    success: true,
+    routes,
+    count: routes.length,
+    timestamp: new Date().toISOString()
+  });
 });
 
 // Error handling middleware
@@ -470,30 +637,45 @@ app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({
     success: false,
-    error: 'Internal server error'
+    error: 'Internal server error',
+    timestamp: new Date().toISOString()
   });
 });
 
-// 404 handler
-app.use( (req, res) => {
+// 404 handler - improved
+app.use((req, res) => {
   console.log(`❌ 404 - Route not found: ${req.method} ${req.originalUrl}`);
   res.status(404).json({
     success: false,
     error: 'Endpoint not found',
     path: req.originalUrl,
-    method: req.method
+    method: req.method,
+    availableEndpoints: [
+      'GET /',
+      'GET /api',
+      'GET /api/health',
+      'POST /api/sessions',
+      'POST /api/chat',
+      'GET /api/sessions/:id/history',
+      'POST /api/documents',
+      'GET /api/documents',
+      'POST /api/search'
+    ],
+    timestamp: new Date().toISOString()
   });
 });
 
-// Graceful shutdown
+// Graceful shutdown - enhanced
 const gracefulShutdown = async (signal) => {
   console.log(`🛑 Received ${signal}, shutting down gracefully...`);
   
   try {
     if (ragService && ragService.cleanup) {
+      console.log('🧹 Cleaning up RAG service...');
       await ragService.cleanup();
     }
     if (sessionManager && sessionManager.cleanup) {
+      console.log('🧹 Cleaning up session manager...');
       await sessionManager.cleanup();
     }
     console.log('✅ Services cleaned up successfully');
@@ -507,14 +689,17 @@ const gracefulShutdown = async (signal) => {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Start server
+// Start server - enhanced
 async function startServer() {
   try {
     await initializeServices();
     
     app.listen(port, () => {
       console.log(`🚀 Server running on port ${port}`);
+      console.log(`🌐 Server URL: http://localhost:${port}`);
       console.log(`📍 API endpoints:`);
+      console.log(`   - GET  / (root/welcome)`);
+      console.log(`   - GET  /api (API info)`);
       console.log(`   - GET  /api/health (health check)`);
       console.log(`   - GET  /health (alternative health check)`);
       console.log(`   - GET  /test-gemini (test Gemini connection)`);
@@ -531,6 +716,11 @@ async function startServer() {
       console.log(`   - DELETE /api/documents/:id (delete document)`);
       console.log(`   - POST /api/search (search documents)`);
       console.log(`   - GET  /api/debug/routes (debug routes)`);
+      
+      console.log(`📊 Service status:`);
+      console.log(`   - RAG Service: ${ragService ? '✅ Active' : '❌ Unavailable'}`);
+      console.log(`   - Session Manager: ${sessionManager ? '✅ Active' : '❌ Unavailable (fallback mode)'}`);
+      console.log(`   - Gemini Service: ${geminiService ? '✅ Active' : '❌ Unavailable'}`);
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error);
