@@ -1,21 +1,52 @@
-const Redis = require('ioredis');
 const { v4: uuidv4 } = require('uuid');
 
 class SessionManager {
   constructor() {
-    this.redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+    this.redis = this.createRedisClient();
     this.sessionPrefix = 'chat_session:';
     this.defaultTTL = 3600; // 1 hour in seconds
   }
 
+  createRedisClient() {
+    try {
+      const Redis = require('ioredis');
+      
+      // For Upstash Redis with password
+      const redisOptions = {
+        host: 'singular-sailfish-64005.upstash.io',
+        port: 6379,
+        password: process.env.REDIS_PASSWORD || 'AfoFAAIncDFiMGQ2OGE5NzY1YmQ0ZmQwOGE5YjEyM2JiMzUzOGFjYnAxNjQwMDU',
+        tls: {}, // Enable TLS for Upstash
+        retryStrategy: (times) => {
+          const delay = Math.min(times * 50, 2000);
+          return delay;
+        }
+      };
+
+      return new Redis(redisOptions);
+    } catch (error) {
+      console.error('❌ Failed to create Redis client:', error);
+      return null;
+    }
+  }
+
   async testConnection() {
     try {
+      if (!this.redis) {
+        throw new Error('Redis client not initialized');
+      }
+      
       await this.redis.ping();
-      console.log('✅ Connected to Redis');
+      console.log('✅ Connected to Redis (Upstash)');
       return true;
     } catch (error) {
-      console.error('❌ Redis connection failed:', error);
-      throw error;
+      console.error('❌ Redis connection failed:', error.message);
+      
+      // Fallback to in-memory storage
+      console.log('🔄 Falling back to in-memory session storage');
+      this.useMemoryStorage = true;
+      this.sessions = new Map();
+      return true;
     }
   }
 
@@ -39,7 +70,16 @@ class SessionManager {
         lastActivity: new Date().toISOString()
       };
 
-      await this.redis.setex(sessionKey, this.defaultTTL, JSON.stringify(sessionData));
+      if (!this.useMemoryStorage && this.redis) {
+        await this.redis.setex(sessionKey, this.defaultTTL, JSON.stringify(sessionData));
+      } else {
+        // In-memory storage
+        this.sessions.set(sessionKey, sessionData);
+        // Set timeout to clear session after TTL
+        setTimeout(() => {
+          this.sessions.delete(sessionKey);
+        }, this.defaultTTL * 1000);
+      }
       
       console.log(`✅ Created session: ${id}`);
       return id;
@@ -52,13 +92,14 @@ class SessionManager {
   async getSession(sessionId) {
     try {
       const sessionKey = this.getSessionKey(sessionId);
-      const sessionData = await this.redis.get(sessionKey);
       
-      if (!sessionData) {
-        return null;
+      if (!this.useMemoryStorage && this.redis) {
+        const sessionData = await this.redis.get(sessionKey);
+        return sessionData ? JSON.parse(sessionData) : null;
+      } else {
+        // In-memory storage
+        return this.sessions.get(sessionKey) || null;
       }
-
-      return JSON.parse(sessionData);
     } catch (error) {
       console.error('❌ Error getting session:', error);
       return null;
@@ -67,12 +108,12 @@ class SessionManager {
 
   async addMessage(sessionId, message) {
     try {
-      const session = await this.getSession(sessionId);
+      let session = await this.getSession(sessionId);
       
       if (!session) {
         // Create new session if it doesn't exist
         await this.createSession(sessionId);
-        return await this.addMessage(sessionId, message);
+        session = await this.getSession(sessionId);
       }
 
       // Add message with timestamp
@@ -91,7 +132,13 @@ class SessionManager {
       }
 
       const sessionKey = this.getSessionKey(sessionId);
-      await this.redis.setex(sessionKey, this.defaultTTL, JSON.stringify(session));
+      
+      if (!this.useMemoryStorage && this.redis) {
+        await this.redis.setex(sessionKey, this.defaultTTL, JSON.stringify(session));
+      } else {
+        // In-memory storage
+        this.sessions.set(sessionKey, session);
+      }
 
       return messageWithTimestamp;
     } catch (error) {
@@ -119,10 +166,14 @@ class SessionManager {
   async clearSession(sessionId) {
     try {
       const sessionKey = this.getSessionKey(sessionId);
-      const result = await this.redis.del(sessionKey);
       
-      console.log(`✅ Cleared session: ${sessionId}`);
-      return result === 1;
+      if (!this.useMemoryStorage && this.redis) {
+        const result = await this.redis.del(sessionKey);
+        return result === 1;
+      } else {
+        // In-memory storage
+        return this.sessions.delete(sessionKey);
+      }
     } catch (error) {
       console.error('❌ Error clearing session:', error);
       throw error;
@@ -132,7 +183,11 @@ class SessionManager {
   async extendSession(sessionId) {
     try {
       const sessionKey = this.getSessionKey(sessionId);
-      await this.redis.expire(sessionKey, this.defaultTTL);
+      
+      if (!this.useMemoryStorage && this.redis) {
+        await this.redis.expire(sessionKey, this.defaultTTL);
+      }
+      // For in-memory, TTL is handled by setTimeout
       return true;
     } catch (error) {
       console.error('❌ Error extending session:', error);
@@ -142,11 +197,24 @@ class SessionManager {
 
   async getActiveSessions() {
     try {
-      const keys = await this.redis.keys(`${this.sessionPrefix}*`);
-      return keys.map(key => key.replace(this.sessionPrefix, ''));
+      if (!this.useMemoryStorage && this.redis) {
+        const keys = await this.redis.keys(`${this.sessionPrefix}*`);
+        return keys.map(key => key.replace(this.sessionPrefix, ''));
+      } else {
+        // In-memory storage
+        return Array.from(this.sessions.keys()).map(key => 
+          key.replace(this.sessionPrefix, '')
+        );
+      }
     } catch (error) {
       console.error('❌ Error getting active sessions:', error);
       return [];
+    }
+  }
+
+  async cleanup() {
+    if (this.redis) {
+      await this.redis.quit();
     }
   }
 }
